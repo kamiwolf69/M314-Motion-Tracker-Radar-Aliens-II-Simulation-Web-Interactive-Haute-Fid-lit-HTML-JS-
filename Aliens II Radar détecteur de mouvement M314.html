@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>M314 Motion Tracker</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=VT323&display=swap">
+<style>
+  :root { --bg:#000; --fg:#e8f4ff; --btn:#0b1a26; --line:#1ea0e8; box-sizing:border-box;
+    padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px); }
+  html { scroll-padding-top: env(safe-area-inset-top,0px); }
+  html,body { margin:0; background:var(--bg); }
+  body { min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center;
+    color:var(--fg); font-family:'Share Tech Mono',ui-monospace,monospace; }
+  canvas { width:100%; max-width:720px; height:auto; display:block; cursor:crosshair; }
+  .ctl { display:flex; gap:10px; margin:8px 0 18px; flex-wrap:wrap; justify-content:center; }
+  button { background:var(--btn); color:var(--fg); border:1px solid var(--line); padding:10px 18px;
+    font:inherit; letter-spacing:.08em; border-radius:4px; cursor:pointer; }
+  button:hover,button.on { background:var(--line); color:#000; }
+  small { opacity:.55; font-size:12px; margin-bottom:10px; text-align:center; padding:0 12px; }
+</style>
+</head>
+<body>
+<canvas id="c" width="720" height="560"></canvas>
+<div class="ctl">
+  <button id="pw">DÉMARRER</button>
+  <button id="add">+ CONTACT</button>
+  <button id="rst">RESET</button>
+</div>
+<small>Cliquez dans le demi-disque pour placer un contact. Le bip s'accélère à mesure que le plus proche se rapproche.</small>
+
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const W = cv.width, H = cv.height, cx = W/2, cy = 330, R = 310;
+const barTop = cy + 82, barH = 82, WHITE = 'rgba(255,255,255,.92)', BLUE = '#1ea0e8';
+const MAXM = 30; // portée affichée en mètres
+let running = false, S = Math.PI, dir = 1, prevS = Math.PI, last = performance.now(), lastBeep = 0;
+let targets = [];
+
+/* ---------- Audio : ping bref du M314 ---------- */
+let ac = null;
+function beep(near) {
+  if (!ac) return;
+  const t = ac.currentTime, o = ac.createOscillator(), g = ac.createGain();
+  o.type = 'sine'; o.frequency.setValueAtTime(1500 + (1 - near) * 500, t);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.35, t + 0.003);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.11);
+  o.connect(g); g.connect(ac.destination); o.start(t); o.stop(t + 0.12);
+}
+
+/* ---------- Contacts ---------- */
+function spawn(x, y) {
+  if (x === undefined) {
+    const a = Math.PI + 0.15 + Math.random() * (Math.PI - 0.3), d = R * (0.45 + Math.random() * 0.5);
+    x = Math.cos(a) * d; y = Math.sin(a) * d;
+  }
+  targets.push({ x, y, sp: 5 + Math.random() * 11, r: 16 + Math.random() * 10, b: 0, ph: Math.random() * 9 });
+}
+for (let i = 0; i < 4; i++) spawn();
+
+/* ---------- Dessin des éléments fixes ---------- */
+function ring(r, w = 1.6) { ctx.lineWidth = w; ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke(); }
+function tab(deg, r1, r2, hw, fill) {
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(-deg * Math.PI / 180);
+  if (fill) { ctx.fillStyle = fill; ctx.fillRect(r2, -hw, r1 - r2, hw * 2); }
+  ctx.strokeRect(r2, -hw, r1 - r2, hw * 2); ctx.restore();
+}
+function drawFrame() {
+  ctx.strokeStyle = WHITE; ctx.lineWidth = 1.6;
+  // anneau extérieur double + pattes
+  ring(R); ring(R - 18);
+  [12, 33, 68, 112, 147, 168].forEach(d => tab(d, R + 3, R - 21, 7, '#000'));
+  ctx.lineWidth = 3; [[20, 28], [48, 58], [78, 86], [94, 102], [122, 132], [152, 160]].forEach(([a, b]) => {
+    ctx.beginPath(); ctx.arc(cx, cy, R - 9, -b * Math.PI / 180, -a * Math.PI / 180); ctx.stroke(); });
+  // anneau intérieur
+  const r2 = R * 0.52; ctx.lineWidth = 1.6; ring(r2); ring(r2 - 12);
+  [20, 160, 80, 100].forEach(d => tab(d, r2 + 2, r2 - 14, 5, '#000'));
+  ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(cx, cy, r2 - 6, -108 * Math.PI / 180, -72 * Math.PI / 180); ctx.stroke();
+  // axe vertical
+  ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(cx, cy - R + 18); ctx.lineTo(cx, cy - r2); ctx.stroke();
+  // petits cercles + trait blanc
+  const dx = R * 0.3;
+  ctx.fillStyle = '#000'; ctx.lineWidth = 1.5;
+  [-dx, dx].forEach(o => { ctx.beginPath(); ctx.arc(cx + o, cy, 5, 0, 7); ctx.fill(); ctx.stroke(); });
+  ctx.beginPath(); ctx.moveTo(cx + dx, cy - 6);
+  ctx.lineTo(cx + dx + Math.cos(-0.9) * 1 * 0 + 38, cy - 6 - 46); ctx.stroke();
+}
+
+/* ---------- Balayage ---------- */
+function drawSweep() {
+  const rr = R - 18;
+  for (let i = 0; i < 14; i++) {
+    const a = S - dir * i * 0.012 - 0;
+    ctx.strokeStyle = `rgba(30,160,232,${0.22 * (1 - i / 14)})`; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.cos(a) * rr, cy + Math.sin(a) * rr); ctx.stroke();
+  }
+  ctx.strokeStyle = BLUE; ctx.lineWidth = 2; ctx.beginPath();
+  ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.cos(S) * rr, cy + Math.sin(S) * rr); ctx.stroke();
+  // patte bleue mobile sur l'anneau
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(S); ctx.fillStyle = 'rgba(30,160,232,.9)';
+  ctx.fillRect(R - 20, -8, 24, 16); ctx.restore();
+}
+
+/* ---------- Affichage bas ---------- */
+function drawBar(closest) {
+  ctx.fillStyle = BLUE; ctx.fillRect(0, barTop, W, barH);
+  ctx.fillStyle = '#fff'; ctx.font = '26px "Share Tech Mono", monospace'; ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left'; ctx.fillText('Kami Wolf', 18, barTop + barH / 2);
+  ctx.textAlign = 'right'; ctx.fillText('Radar ALIENS', W - 18, barTop + barH / 2);
+  // afficheur rouge central
+  const bw = 150, bh = 96, bx = cx - bw / 2, by = barTop + barH / 2 - bh / 2;
+  ctx.fillStyle = '#000'; ctx.beginPath(); ctx.roundRect(bx, by, bw, bh, 18); ctx.fill();
+  ctx.strokeStyle = '#c4161c'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = '#ff2a2a'; ctx.shadowColor = '#ff2a2a'; ctx.shadowBlur = 10;
+  ctx.textAlign = 'center';
+  const m = closest === null ? '--' : String(Math.min(99, Math.floor(closest / R * MAXM))).padStart(2, '0');
+  ctx.font = '64px VT323, "Share Tech Mono", monospace'; ctx.textAlign = 'right';
+  ctx.fillText(m, cx - 6, by + 38);
+  ctx.textAlign = 'left'; ctx.font = '28px VT323, "Share Tech Mono", monospace';
+  ctx.fillText('..00', cx + 2, by + 30);
+  ctx.textAlign = 'center'; ctx.fillText('m', cx + 36, by + 66);
+  ctx.shadowBlur = 0;
+}
+
+/* ---------- Boucle ---------- */
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  let closest = null;
+
+  if (running) {
+    prevS = S; S += dir * 1.15 * dt;
+    if (S >= 2 * Math.PI) { S = 2 * Math.PI; dir = -1; }
+    if (S <= Math.PI) { S = Math.PI; dir = 1; }
+    const lo = Math.min(prevS, S), hi = Math.max(prevS, S);
+    targets.forEach(t => {
+      const d = Math.hypot(t.x, t.y);
+      if (d > R * 0.07) { // approche + dérive aléatoire
+        t.x += (-t.x / d * t.sp + Math.sin(now / 700 + t.ph) * 6) * dt;
+        t.y += (-t.y / d * t.sp + Math.cos(now / 900 + t.ph) * 6) * dt;
+      } else { t.x += (Math.random() - .5) * 20 * dt; t.y += (Math.random() - .5) * 20 * dt; }
+      if (t.y > -6) t.y = -6;
+      let a = Math.atan2(t.y, t.x); if (a < 0) a += 2 * Math.PI;
+      if (a >= lo && a <= hi) t.b = 1;
+      t.b = Math.max(0, t.b - 0.38 * dt);
+    });
+  }
+  targets.forEach(t => { const d = Math.hypot(t.x, t.y); if (closest === null || d < closest) closest = d; });
+
+  ctx.save(); ctx.beginPath(); ctx.rect(0, 0, W, barTop); ctx.clip();
+  drawFrame();
+  if (running) {
+    targets.forEach(t => {
+      if (t.b < 0.02) return;
+      const px = cx + t.x, py = cy + t.y, g = ctx.createRadialGradient(px, py, 0, px, py, t.r);
+      g.addColorStop(0, `rgba(255,255,255,${t.b})`); g.addColorStop(0.45, `rgba(255,255,255,${t.b * .75})`);
+      g.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(px, py, t.r, 0, 7); ctx.fill();
+    });
+    drawSweep();
+  }
+  ctx.restore();
+  drawBar(running ? closest : null);
+
+  if (running && closest !== null && ac) {
+    const iv = 0.15 + (Math.min(closest, R) / R) * 1.5;
+    if (now / 1000 - lastBeep > iv) { beep(closest / R); lastBeep = now / 1000; }
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* ---------- Contrôles ---------- */
+const pw = document.getElementById('pw');
+pw.onclick = () => {
+  if (!ac) ac = new (window.AudioContext || window.webkitAudioContext)();
+  if (ac.state === 'suspended') ac.resume();
+  running = !running; pw.textContent = running ? 'ARRÊTER' : 'DÉMARRER'; pw.classList.toggle('on', running);
+};
+document.getElementById('add').onclick = () => spawn();
+document.getElementById('rst').onclick = () => { targets = []; };
+cv.addEventListener('click', e => {
+  const r = cv.getBoundingClientRect(), x = (e.clientX - r.left) * W / r.width - cx, y = (e.clientY - r.top) * H / r.height - cy;
+  if (y < -8 && Math.hypot(x, y) < R - 20) spawn(x, y);
+});
+</script>
+</body>
+</html>
